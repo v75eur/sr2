@@ -82,6 +82,19 @@ def get_candles(sym, interval="1h", range_days="60d"):
         log(f"❌ Yahoo {sym}: {e}")
         return []
 
+def calc_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return 0.0
+    tr_list = []
+    for i in range(1, len(candles)):
+        h = candles[i]["h"]
+        l = candles[i]["l"]
+        c_prev = candles[i-1]["c"]
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        tr_list.append(tr)
+    atr = sum(tr_list[-period:]) / period
+    return atr
+
 def sr(cd, mx=3, tol=0.002):
     n = len(cd)
     rr, rs = [], []
@@ -181,11 +194,10 @@ def chart_sr(cd, cp, info, title_suffix=""):
 def analyze_sr2(key, info):
     log(f"🔍 Analyse SR2 {key}...")
     src = info.get("source", "yahoo")
-    
-    # Récupérer les données H3 et H1
+
     if src == "deriv":
-        candles_h3 = get_candles_deriv(info["symbol"], granularity=10800)  # 3 heures
-        candles_h1 = get_candles_deriv(info["symbol"], granularity=3600)   # 1 heure
+        candles_h3 = get_candles_deriv(info["symbol"], granularity=10800)
+        candles_h1 = get_candles_deriv(info["symbol"], granularity=3600)
     else:
         candles_h3 = get_candles(info["symbol"], interval="1h", range_days="60d")
         if len(candles_h3) >= 3:
@@ -198,21 +210,22 @@ def analyze_sr2(key, info):
             candles_h3 = [{"t": int(ts.timestamp()), "o": row['o'], "h": row['h'], "l": row['l'], "c": row['c']} for ts, row in resampled.iterrows()]
             candles_h3 = candles_h3[-50:]
         candles_h1 = get_candles(info["symbol"], interval="1h", range_days="7d")
-    
+
     if not candles_h3 or not candles_h1:
         log(f"⚠️ Pas de données pour {key}")
         return
-    
-    # Canaux H3 et H1
+
     ch_h3 = channel(candles_h3)
     ch_h1 = channel(candles_h1)
-    
-    # Support/Résistance H1
+
     cp = candles_h1[-1]["c"]
     dec = info["dec"]
     rz, sz = sr(candles_h1)
-    
-    # Déterminer les tendances
+
+    # Calcul de l'ATR sur H1 pour filtrer les faux breakouts
+    atr_h1 = calc_atr(candles_h1, 14)
+    seuil_atr_min = 0.00010 if key in ["EURUSD", "GBPUSD"] else (0.5 if key == "XAUUSD" else 5.0)
+
     if ch_h3:
         if ch_h3["slope"] > 0.0001:
             tendance_h3 = "HAUSSIERE"
@@ -222,7 +235,7 @@ def analyze_sr2(key, info):
             tendance_h3 = "LATERALE"
     else:
         tendance_h3 = "INCONNUE"
-    
+
     if ch_h1:
         if ch_h1["slope"] > 0.0001:
             tendance_h1 = "HAUSSIERE"
@@ -232,38 +245,39 @@ def analyze_sr2(key, info):
             tendance_h1 = "LATERALE"
     else:
         tendance_h1 = "INCONNUE"
-    
-    # Conditions de signal
+
     conseil = ""
     msg = ""
     condition_remplie = False
-    
+
     # ACHAT : H3 HAUSSIER + H1 HAUSSIER + Cassure Résistance
     if rz and cp > rz[0] and tendance_h3 == "HAUSSIERE" and tendance_h1 == "HAUSSIERE":
         condition_remplie = True
         conseil = "ACHAT (H3 HAUSSIER + H1 HAUSSIER + Cassure Resistance)"
         msg = f"SIGNAL ACHAT SR2\nH3: HAUSSIERE | H1: HAUSSIERE\nCassure de la resistance {rz[0]:.{dec}f} confirmee par la cloture a {cp:.{dec}f}"
-    
+
     # VENTE : H3 BAISSIER + H1 BAISSIER + Cassure Support
     elif sz and cp < sz[0] and tendance_h3 == "BAISSIERE" and tendance_h1 == "BAISSIERE":
         condition_remplie = True
         conseil = "VENTE (H3 BAISSIER + H1 BAISSIER + Cassure Support)"
         msg = f"SIGNAL VENTE SR2\nH3: BAISSIERE | H1: BAISSIERE\nCassure du support {sz[0]:.{dec}f} confirmee par la cloture a {cp:.{dec}f}"
-    
-    # Si condition remplie, on envoie les notifications
+
     if condition_remplie:
-        full_msg = f"{msg}\n\nPrix: {cp:.{dec}f}\nTendance H3: {tendance_h3}\nTendance H1: {tendance_h1}\n{datetime.now(pytz.timezone('Africa/Porto-Novo')).strftime('%H:%M')}H Benin\nSR2 Bot"
-        
+        # Filtre ATR anti-fausse cassure
+        if atr_h1 < seuil_atr_min:
+            log(f"⏭️ SILENCE {key} - Signal SR2 détecté mais ATR H1 trop faible ({atr_h1:.5f}) [Risque de fausse cassure]")
+            return
+
+        full_msg = f"{msg}\n\nPrix: {cp:.{dec}f}\nTendance H3: {tendance_h3}\nTendance H1: {tendance_h1}\nATR H1: {atr_h1:.{dec}f}\n{datetime.now(pytz.timezone('Africa/Porto-Novo')).strftime('%H:%M')}H Benin\nSR2 Bot"
+
         log(f"📤 SIGNAL {key} - {conseil}")
         send(info["ntfy"], f"ALERTE {key} - {conseil}", full_msg)
-        
-        # Graphique H3
+
         img_h3 = chart_sr(candles_h3, cp, info, "H3")
         if img_h3:
             time.sleep(1)
             send(info["ntfy"], f"{key} H3 - {conseil}", "SR2 H3", img_h3)
-        
-        # Graphique H1
+
         img_h1 = chart_sr(candles_h1, cp, info, "H1")
         if img_h1:
             time.sleep(1)
@@ -275,10 +289,10 @@ if __name__ == "__main__":
     log("🚀 SR2 BOT - Stratégie H3 + H1")
     now = datetime.now(pytz.timezone('Africa/Porto-Novo'))
     h, j = now.hour, now.weekday()
-    
+
     log("→ V75 (7j/7)")
     analyze_sr2("V75", PAIRS["V75"])
-    
+
     if j < 5:
         log(f"📊 Analyse Forex {h}H")
         for key in ["XAUUSD", "EURUSD", "GBPUSD"]:
@@ -286,5 +300,5 @@ if __name__ == "__main__":
             analyze_sr2(key, PAIRS[key])
     else:
         log(f"💤 Forex ferme week-end")
-    
+
     log("✅ Termine")
